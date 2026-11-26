@@ -1,40 +1,64 @@
-"""מנוע המשחק: מצב, עמלות, מיסים ושמירה ל-JSON. ללא תלות ב-Streamlit / yfinance."""
+"""מנוע המשחק: מצב, עמלות, מיסים, אימות ושמירה. ללא תלות ב-Streamlit / yfinance."""
 from __future__ import annotations
 
 import hashlib
 import hmac
-import json
 import os
+import random
 import secrets
-import tempfile
 import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 
+import storage
+from storage import ConflictError, StorageError
+
 START_CASH = 10_000.00
 FEE_RATE = 0.01        # 1% על כל קנייה וכל מכירה
 TAX_RATE = 0.25        # 25% על רווח הון נטו (אם יש)
 BENCH_TICKER = "SPY"
-BOT_NAME = "מדד S&P 500 (SPY)"
+BOT_NAME = "S&P 500 Index (SPY)"
+LEGACY_BOT_NAME = "מדד S&P 500 (SPY)"   # שם קודם; משחקים קיימים מועברים אוטומטית
 MIN_TRADE = 1.00       # מינימום עסקה בדולרים
-
-DATA_FILE = Path(os.environ.get("PAPER_DATA_FILE", Path(__file__).with_name("game_data.json")))
+MIN_PASSWORD = 6
+MAX_PASSWORD = 64
 
 # נעילה אחת לכל התהליך: כל הסשנים של Streamlit חולקים את אותו מודול
 LOCK = threading.RLock()
 
-# הגנה בסיסית מפני ניחוש PIN (בזיכרון בלבד)
+# הגנה בסיסית מפני ניחוש סיסמאות (בזיכרון בלבד)
 _FAILS: dict[str, tuple[int, float]] = {}
 MAX_FAILS = 5
 LOCKOUT_SECONDS = 60
+
+_BACKEND = None
 
 
 class GameError(Exception):
     """שגיאה שמוצגת למשתמש (הודעה בעברית)."""
 
 
-# ---------------------------------------------------------------- שמירה / טעינה
+# ---------------------------------------------------------------- אחסון
+def backend():
+    global _BACKEND
+    want_supabase = bool(os.environ.get("SUPABASE_URL") and os.environ.get("SUPABASE_SERVICE_KEY"))
+    stale = want_supabase and not isinstance(_BACKEND, storage.SupabaseBackend) and getattr(_BACKEND, "auto", False)
+    if _BACKEND is None or stale:
+        _BACKEND = storage.default_backend(Path(__file__).with_name("game_data.json"))
+        _BACKEND.auto = True   # נוצר אוטומטית (לא הוגדר ידנית בבדיקות), אפשר להחליף אותו
+    return _BACKEND
+
+
+def set_backend(b) -> None:
+    """לבדיקות / הגדרה ידנית."""
+    global _BACKEND
+    _BACKEND = b
+
+
+def storage_name() -> str:
+    return backend().name
+
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -45,43 +69,54 @@ def new_state() -> dict:
 
 
 def load_state() -> dict:
-    with LOCK:
-        if not DATA_FILE.exists():
-            return new_state()
-        try:
-            with open(DATA_FILE, "r", encoding="utf-8") as f:
-                state = json.load(f)
-        except json.JSONDecodeError as e:
-            # לא מוחקים קובץ פגום: שומרים עותק ומתריעים
-            backup = DATA_FILE.with_suffix(f".corrupt-{int(time.time())}.json")
-            os.replace(DATA_FILE, backup)
-            raise GameError(f"קובץ הנתונים היה פגום ונשמר בשם {backup.name}. מתחילים משחק חדש.") from e
-        state.setdefault("players", {})
-        state.setdefault("game_start", None)
-        return state
+    try:
+        raw, rev = backend().load()
+    except StorageError as e:
+        raise GameError(str(e)) from e
+    state = raw if raw else new_state()
+    state.setdefault("players", {})
+    state.setdefault("game_start", None)
+    state["_rev"] = rev
+    return state
 
 
 def save_state(state: dict) -> None:
-    """כתיבה אטומית: קובץ זמני ואז החלפה, כדי שקריסה באמצע לא תשחית את הנתונים."""
-    with LOCK:
-        DATA_FILE.parent.mkdir(parents=True, exist_ok=True)
-        fd, tmp = tempfile.mkstemp(dir=DATA_FILE.parent, prefix=".tmp_game_", suffix=".json")
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as f:
-                json.dump(state, f, ensure_ascii=False, indent=2)
-                f.flush()
-                os.fsync(f.fileno())
-            os.replace(tmp, DATA_FILE)
-        except BaseException:
-            if os.path.exists(tmp):
-                os.remove(tmp)
-            raise
+    """מעלה ConflictError אם המצב השתנה במקביל (ה-backend מזהה לפי rev)."""
+    rev = state.get("_rev", 0)
+    data = {k: v for k, v in state.items() if k != "_rev"}
+    try:
+        backend().save(data, rev)
+    except StorageError as e:
+        raise GameError(str(e)) from e
+    state["_rev"] = rev + 1
 
 
-# ---------------------------------------------------------------- שחקנים ו-PIN
+class _NoSave(Exception):
+    def __init__(self, value=None):
+        self.value = value
 
-def _hash_pin(pin: str, salt: str) -> str:
-    return hashlib.pbkdf2_hmac("sha256", pin.encode(), bytes.fromhex(salt), 100_000).hex()
+
+def _transaction(fn):
+    """טוען מצב, מריץ fn(state) ושומר. אם מישהו שמר באותו רגע (ConflictError) טוענים מחדש וחוזרים על הפעולה."""
+    for attempt in range(8):
+        with LOCK:
+            state = load_state()
+            try:
+                result = fn(state)
+            except _NoSave as ns:
+                return ns.value
+            try:
+                save_state(state)
+                return result
+            except ConflictError:
+                pass
+        time.sleep(random.uniform(0.05, 0.25) * (attempt + 1))
+    raise GameError("The server is busy. Try again in a moment.")
+
+
+# ---------------------------------------------------------------- שחקנים וסיסמאות
+def _hash_pw(password: str, salt: str) -> str:
+    return hashlib.pbkdf2_hmac("sha256", password.encode(), bytes.fromhex(salt), 200_000).hex()
 
 
 def _blank_player(**extra) -> dict:
@@ -98,72 +133,88 @@ def _blank_player(**extra) -> dict:
 
 
 def player_names(state: dict) -> list[str]:
-    """שמות השחקנים האנושיים (בלי הבוט), לתפריט ההתחברות."""
     return sorted(n for n, p in state["players"].items() if not p.get("is_bot"))
 
 
-def register_player(name: str, pin: str) -> None:
+def find_player(state: dict, username: str) -> str | None:
+    """חיפוש שם משתמש ללא תלות באותיות גדולות/קטנות. מחזיר את השם המדויק השמור."""
+    u = (username or "").strip().casefold()
+    for n, p in state["players"].items():
+        if not p.get("is_bot") and n.casefold() == u:
+            return n
+    return None
+
+
+def register_player(name: str, password: str) -> str:
+    """יוצר שחקן ומחזיר את שם המשתמש השמור."""
     name = (name or "").strip()
     if not (2 <= len(name) <= 24):
-        raise GameError("השם חייב להכיל 2 עד 24 תווים.")
-    if name == BOT_NAME:
-        raise GameError("השם הזה שמור לבוט המדד.")
-    if not (len(pin) == 4 and pin.isdigit()):
-        raise GameError("קוד ה-PIN חייב להיות בדיוק 4 ספרות.")
-    with LOCK:
-        state = load_state()
-        if name in state["players"]:
-            raise GameError("כבר קיים שחקן בשם הזה.")
+        raise GameError("Username must be 2 to 24 characters.")
+    if name.casefold() == BOT_NAME.casefold():
+        raise GameError("That name is reserved for the index bot.")
+    if not (MIN_PASSWORD <= len(password or "") <= MAX_PASSWORD):
+        raise GameError(f"Password must be at least {MIN_PASSWORD} characters.")
+
+    def work(state):
+        if any(n.casefold() == name.casefold() for n in state["players"]):
+            raise GameError("That username is taken.")
         salt = secrets.token_hex(16)
-        state["players"][name] = _blank_player(pin_salt=salt, pin_hash=_hash_pin(pin, salt))
-        save_state(state)
+        state["players"][name] = _blank_player(pw_salt=salt, pw_hash=_hash_pw(password, salt))
+        return name
+
+    return _transaction(work)
 
 
-def verify_pin(name: str, pin: str) -> bool:
-    fails, until = _FAILS.get(name, (0, 0.0))
+def authenticate(username: str, password: str) -> str | None:
+    """מחזיר את שם המשתמש אם הפרטים נכונים, אחרת None. נועל ל-60 שניות אחרי 5 כשלונות."""
+    key = (username or "").strip().casefold()
+    fails, until = _FAILS.get(key, (0, 0.0))
     if fails >= MAX_FAILS and time.time() < until:
-        raise GameError(f"יותר מדי ניסיונות שגויים. נסו שוב בעוד {int(until - time.time())} שניות.")
+        raise GameError(f"Too many failed attempts. Try again in {int(until - time.time())} seconds.")
     state = load_state()
-    p = state["players"].get(name)
-    ok = bool(
-        p and not p.get("is_bot") and len(pin) == 4 and pin.isdigit()
-        and hmac.compare_digest(_hash_pin(pin, p["pin_salt"]), p["pin_hash"])
-    )
-    if ok:
-        _FAILS.pop(name, None)
+    name = find_player(state, username)
+    if name:
+        p = state["players"][name]
+        ok = hmac.compare_digest(_hash_pw(password or "", p["pw_salt"]), p["pw_hash"])
     else:
-        fails = 1 if (fails >= MAX_FAILS and time.time() >= until) else fails + 1
-        _FAILS[name] = (fails, time.time() + LOCKOUT_SECONDS)
-    return ok
+        _hash_pw(password or "", "00" * 16)   # מאזן זמני תגובה, כדי לא לחשוף אילו שמות קיימים
+        ok = False
+    if ok:
+        _FAILS.pop(key, None)
+        return name
+    fails = 1 if (fails >= MAX_FAILS and time.time() >= until) else fails + 1
+    _FAILS[key] = (fails, time.time() + LOCKOUT_SECONDS)
+    return None
 
 
 # ---------------------------------------------------------------- בוט הייחוס
-
 def ensure_bot(spy_price: float) -> bool:
     """יוצר את בוט ה-SPY (קנה בכל ה-$10,000, ללא עמלה, ולא פועל יותר). True אם נוצר עכשיו."""
-    with LOCK:
-        state = load_state()
+    if not spy_price or spy_price <= 0:
+        return False
+
+    def work(state):
         if BOT_NAME in state["players"]:
-            return False
-        if not spy_price or spy_price <= 0:
-            return False
+            raise _NoSave(False)
+        if LEGACY_BOT_NAME in state["players"]:        # שדרוג משחק קיים: רק משנים את שם הבוט
+            state["players"][BOT_NAME] = state["players"].pop(LEGACY_BOT_NAME)
+            return True
+        shares = START_CASH / spy_price
         bot = _blank_player(is_bot=True)
         bot["cash"] = 0.0
-        bot["positions"][BENCH_TICKER] = {"shares": START_CASH / spy_price, "cost_basis": START_CASH}
+        bot["positions"][BENCH_TICKER] = {"shares": shares, "cost_basis": START_CASH}
         bot["transactions"].append({
-            "ts": _now(), "type": "buy", "ticker": BENCH_TICKER, "price": spy_price,
-            "shares": START_CASH / spy_price, "gross": START_CASH, "fee": 0.0, "tax": 0.0,
-            "realized_gain": 0.0, "cash_after": 0.0,
+            "ts": _now(), "type": "buy", "ticker": BENCH_TICKER, "price": spy_price, "shares": shares,
+            "gross": START_CASH, "fee": 0.0, "tax": 0.0, "realized_gain": 0.0, "cash_after": 0.0,
         })
         state["players"][BOT_NAME] = bot
-        if not state.get("game_start"):
-            state["game_start"] = _now()
-        save_state(state)
+        state["game_start"] = state.get("game_start") or _now()
         return True
+
+    return _transaction(work)
 
 
 # ---------------------------------------------------------------- חישובי עסקאות
-
 def _r(x: float) -> float:
     return round(x + 0.0, 2)
 
@@ -197,19 +248,25 @@ def quote_sell(position: dict, amount: float | None, price: float) -> dict:
 
 
 # ---------------------------------------------------------------- ביצוע
+def _get_human(state: dict, name: str) -> dict:
+    p = state["players"].get(name)
+    if not p or p.get("is_bot"):
+        raise GameError("Player not found.")
+    return p
+
 
 def buy(name: str, ticker: str, amount: float, price: float, allowed: set[str] | None = None) -> dict:
     if allowed is not None and ticker not in allowed:
-        raise GameError("אפשר לסחור רק במניות מתוך S&P 500.")
+        raise GameError("Only S&P 500 stocks can be traded.")
     if not price or price <= 0:
-        raise GameError("לא התקבל מחיר תקין למניה.")
+        raise GameError("No valid price for this stock.")
     if amount < MIN_TRADE:
-        raise GameError(f"עסקה מינימלית: ${MIN_TRADE:.2f}.")
-    with LOCK:
-        state = load_state()
+        raise GameError(f"Minimum trade is ${MIN_TRADE:.2f}.")
+
+    def work(state):
         p = _get_human(state, name)
         if amount > p["cash"] + 0.004:
-            raise GameError(f"אין מספיק מזומן. זמין: ${p['cash']:,.2f}.")
+            raise GameError(f"Not enough cash. Available: ${p['cash']:,.2f}.")
         q = quote_buy(amount, price)
         p["cash"] = _r(p["cash"] - q["gross"])
         pos = p["positions"].setdefault(ticker, {"shares": 0.0, "cost_basis": 0.0})
@@ -219,28 +276,29 @@ def buy(name: str, ticker: str, amount: float, price: float, allowed: set[str] |
         tx = {"ts": _now(), "type": "buy", "ticker": ticker, "price": price, "shares": q["shares"],
               "gross": q["gross"], "fee": q["fee"], "tax": 0.0, "realized_gain": 0.0, "cash_after": p["cash"]}
         p["transactions"].append(tx)
-        save_state(state)
         return tx
+
+    return _transaction(work)
 
 
 def sell(name: str, ticker: str, amount: float | None, price: float, allowed: set[str] | None = None) -> dict:
     """amount=None => מכירת כל הפוזיציה."""
     if allowed is not None and ticker not in allowed:
-        raise GameError("אפשר לסחור רק במניות מתוך S&P 500.")
+        raise GameError("Only S&P 500 stocks can be traded.")
     if not price or price <= 0:
-        raise GameError("לא התקבל מחיר תקין למניה.")
-    with LOCK:
-        state = load_state()
+        raise GameError("No valid price for this stock.")
+
+    def work(state):
         p = _get_human(state, name)
         pos = p["positions"].get(ticker)
         if not pos or pos["shares"] <= 0:
-            raise GameError("אין לך מניות מהסוג הזה.")
+            raise GameError("You don't own this stock.")
         value = pos["shares"] * price
         if amount is not None:
             if amount < MIN_TRADE and amount < value - 0.005:
-                raise GameError(f"עסקה מינימלית: ${MIN_TRADE:.2f}.")
+                raise GameError(f"Minimum trade is ${MIN_TRADE:.2f}.")
             if amount > value + 0.005:
-                raise GameError(f"אפשר למכור עד ${value:,.2f} ממניה זו.")
+                raise GameError(f"You can sell up to ${value:,.2f} of this stock.")
         q = quote_sell(pos, amount, price)
         p["cash"] = _r(p["cash"] + q["net_cash"])
         if q["sell_all"]:
@@ -254,19 +312,12 @@ def sell(name: str, ticker: str, amount: float | None, price: float, allowed: se
               "gross": q["gross"], "fee": q["fee"], "tax": q["tax"], "realized_gain": _r(q["gain"]),
               "cash_after": p["cash"]}
         p["transactions"].append(tx)
-        save_state(state)
         return tx
 
-
-def _get_human(state: dict, name: str) -> dict:
-    p = state["players"].get(name)
-    if not p or p.get("is_bot"):
-        raise GameError("שחקן לא קיים.")
-    return p
+    return _transaction(work)
 
 
 # ---------------------------------------------------------------- שווי וטבלת מובילים
-
 def held_tickers(state: dict) -> set[str]:
     return {t for p in state["players"].values() for t in p["positions"]}
 

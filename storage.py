@@ -24,7 +24,7 @@ class StorageError(Exception):
 
 # ---------------------------------------------------------------- קובץ מקומי
 class FileBackend:
-    name = "קובץ מקומי"
+    name = "Local file"
 
     def __init__(self, path: Path):
         self.path = Path(path)
@@ -38,7 +38,7 @@ class FileBackend:
         except json.JSONDecodeError as e:
             backup = self.path.with_suffix(f".corrupt-{int(time.time())}.json")
             os.replace(self.path, backup)   # לא מוחקים קובץ פגום
-            raise StorageError(f"קובץ הנתונים היה פגום ונשמר בשם {backup.name}. רעננו כדי להתחיל משחק חדש.") from e
+            raise StorageError(f"The data file was corrupt and was saved as {backup.name}. Refresh to start a new game.") from e
 
     def save(self, state: dict, rev: int) -> None:
         """כתיבה אטומית: קובץ זמני ואז החלפה. ההגנה מפני כתיבה בו-זמנית היא הנעילה בתהליך (engine.LOCK)."""
@@ -80,13 +80,13 @@ class SupabaseBackend:
         try:
             r = self.s.request(method, url, timeout=self.TIMEOUT, **kw)
         except Exception as e:  # רשת, DNS, timeout
-            raise StorageError("אין חיבור לבסיס הנתונים. נסו שוב בעוד רגע.") from e
+            raise StorageError("Can't reach the database. Try again in a moment.") from e
         return r
 
     def load(self):
         r = self._call("GET", self.base, params={"id": f"eq.{self.ROW_ID}", "select": "data,rev"})
         if r.status_code != 200:
-            raise StorageError(f"שגיאת בסיס נתונים ({r.status_code}). בדקו את ה-URL והמפתח ב-secrets ואת יצירת הטבלה.")
+            raise StorageError(f"Database error ({r.status_code}). Check the URL and key in your secrets, and that the table was created.")
         rows = r.json()
         if not rows:
             return None, 0
@@ -100,13 +100,13 @@ class SupabaseBackend:
             if r.status_code == 409:
                 raise ConflictError()
             if r.status_code not in (200, 201, 204):
-                raise StorageError(f"שמירה נכשלה ({r.status_code}).")
+                raise StorageError(f"Save failed ({r.status_code}).")
             return
         r = self._call("PATCH", self.base, headers={"Prefer": "return=representation"},
                        params={"id": f"eq.{self.ROW_ID}", "rev": f"eq.{rev}"},
                        json={"data": state, "rev": rev + 1, "updated_at": now})
         if r.status_code not in (200, 204):
-            raise StorageError(f"שמירה נכשלה ({r.status_code}).")
+            raise StorageError(f"Save failed ({r.status_code}).")
         if r.status_code == 200 and not r.json():
             raise ConflictError()
 
